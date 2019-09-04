@@ -41,6 +41,8 @@ oc的内存管理是通过引用计数的方式实现的，标志位retainCount 
 下载地址
 https://opensource.apple.com/source/objc4/objc4-756.2/
 
+### 认识 NSObject
+
 在解决问题之前先认识一下NSObject 内部的实现，直接从下载的源码中就可以看到NSObject
 
 ``` c
@@ -97,6 +99,139 @@ metaClass 就是元类对象
 
 简单了解对象有实例对象，类对象，元类对象后，NSObject中的isa 成员变量其实就是用来指向类对象的标识，类对象中的isa指针就是指向元类对象。
 
+搞清楚isa是做什么的之后，我们注意力应该会被bits
+```
+class_data_bits_t bits;    // class_rw_t * plus custom rr/alloc flags
+
+struct class_data_bits_t {
+    public:
+    class_rw_t* data() {
+        return (class_rw_t *)(bits & FAST_DATA_MASK);
+    }
+}
+
+struct class_rw_t {
+    // Be warned that Symbolication knows the layout of this structure.
+    uint32_t flags;
+    uint32_t version;
+
+    const class_ro_t *ro;
+
+    method_array_t methods;
+    property_array_t properties;
+    protocol_array_t protocols;
+    Class firstSubclass;
+    Class nextSiblingClass;
+}
+
+```
+
+我们可以看到bits 有一个 getData的方法可以获取到一个 class_rw_t ，这里面就有我们常见的 methods，properties，protocols。
+
+### TaggedPointer
+在继续寻找内存管理实现之前有个东西需要注意一下
+iPhone 5s开始，苹果开始启用64位的操作系统，那么就会带来一个问题，一个指针的长度由原来的 32位变成了 64位
+如下代码
+```
+//32位操作系统  number 指针使用 4b， NSNumber对象占用8b 也就是总共 12个字节
+NSNumber *number = [NSNumber numberWithInteger:1];
+
+//64位操作系统  number 指针使用 8b， NSNumber对象占用16b 也就是总共 24个字节
+NSNumber *number = [NSNumber numberWithInteger:1];
+
+```
+苹果为了解决这个问题 引入了 tagged pointer的概念，解决方案就是 我们可以不用创建这个对象，直接把值存放在本该引用到改对象的指针中，所以说并不是所有的引用类型的变量它的值一定在heap内存中。
+
+具体可以看这篇 https://www.jianshu.com/p/dcbf48a733f9
 
 
 ### retainCount
+retainCount 到底存在哪，我们查看NSobject类的成员变量 好像并没有看到相关的retainCount的成员变量，直接看一下retainCount的方法的实现
+
+```
+- (NSUInteger)retainCount {
+    return ((id)self)->rootRetainCount();
+}
+
+inline uintptr_t 
+objc_object::rootRetainCount()
+{
+    if (isTaggedPointer()) return (uintptr_t)this;
+
+    sidetable_lock();
+    isa_t bits = LoadExclusive(&isa.bits);
+    ClearExclusive(&isa.bits);
+    if (bits.nonpointer) {
+        uintptr_t rc = 1 + bits.extra_rc;
+        if (bits.has_sidetable_rc) {
+            rc += sidetable_getExtraRC_nolock();
+        }
+        sidetable_unlock();
+        return rc;
+    }
+
+    sidetable_unlock();
+    return sidetable_retainCount();
+}
+
+```
+
+我们可以看到这是获取 retainCount 的方法，如果是taggedPoint直接返回，因为他并不存在heap中，
+bits.nonpointer方法 牵扯到isa指针优化的问题，我们之前说过实例对象的isa指针指向类对象，但是现在我们大多数是64位的设备，如果用一个8个字节的存储空间只是为了存放一个元类对象会造成一些内存浪费，那么可以通过跟taggedPointer的方式一样进行指针优化，将isa 指针扩展成下面的结构体
+
+```
+# if __arm64__
+
+#   define ISA_MASK        0x0000000ffffffff8ULL
+#   define ISA_MAGIC_MASK  0x000003f000000001ULL
+#   define ISA_MAGIC_VALUE 0x000001a000000001ULL
+#   define ISA_BITFIELD                                                      \
+      uintptr_t nonpointer        : 1;                                       \
+      uintptr_t has_assoc         : 1;                                       \
+      uintptr_t has_cxx_dtor      : 1;                                       \
+      uintptr_t shiftcls          : 33; /*MACH_VM_MAX_ADDRESS 0x1000000000*/ \
+      uintptr_t magic             : 6;                                       \
+      uintptr_t weakly_referenced : 1;                                       \
+      uintptr_t deallocating      : 1;                                       \
+      uintptr_t has_sidetable_rc  : 1;                                       \
+      uintptr_t extra_rc          : 19
+#   define RC_ONE   (1ULL<<45)
+#   define RC_HALF  (1ULL<<18)
+
+# elif __x86_64__
+....
+```
+
+这里我只截取arm64 版本的定义
+* nonpointer 标识位，是否启用了isa 指针优化
+* shiftcls 用来存放指向源指向对象的非零地址
+* weakly_referenced 是否有弱引用
+* deallocating 正在释放标识位
+* has_sidetable_rc 是否有用到sidetable来记录retainCount
+* extra_rc retainCount
+
+知道这些后我们再看这段代码
+
+```
+    isa_t bits = LoadExclusive(&isa.bits);
+    if (bits.nonpointer) {  //判断是否启用isa指针优化
+        //已经启动isa指针优化
+        uintptr_t rc = 1 + bits.extra_rc; //retainCount 为 bits.extra_rc + 1
+        if (bits.has_sidetable_rc) { //判断是是否有用到sidetable来记录retainCount
+            //如果有用到那么 两个加在一起
+            rc += sidetable_getExtraRC_nolock();
+        }
+        sidetable_unlock();
+        return rc;
+    }
+    没有使用isa指针优化 直接获取sidetable中的retainCount
+    sidetable_unlock();
+    return sidetable_retainCount();
+
+
+```
+现在已经搞清楚了 retainCount 到底存放在哪了
+总结如下：
+如果启动了isa指针优化，那么会有一部分存放在isa指针中，如果isa指针中存放不下，那么久会放倒sidetable中。
+如果没有启动isa指针优化，那么就直接存放在 sidetable中
+
